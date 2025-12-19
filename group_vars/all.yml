@@ -1,0 +1,16 @@
+---
+# Variáveis Globais para o Playbook de Backup
+
+# Diretório onde os backups serão armazenados
+backup_dir: "/root/bkp"
+
+# Caminho para o script setup.sh do Ansible
+# Ajuste conforme a localização no seu ambiente
+setup_script_path: "./setup.sh"
+
+# Número máximo de backups a manter (os mais recentes)
+max_backups_to_keep: 3
+
+# Opções adicionais (se necessário)
+# backup_retention_days: 7
+# notification_email: admin@example.com

@@ -1,0 +1,111 @@
+---
+# Playbook para Backup Diário do Ansible AWX/Tower
+# Mantém apenas os últimos 3 backups no diretório
+
+- name: Backup Diário do Ansible com Rotação de Arquivos
+  hosts: ansible_server
+  become: yes
+  gather_facts: yes
+
+  vars:
+    backup_dir: "/root/bkp"
+    setup_script_path: "./setup.sh"
+    max_backups_to_keep: 3
+    backup_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+
+  tasks:
+    - name: Verificar se o diretório de backup existe
+      ansible.builtin.stat:
+        path: "{{ backup_dir }}"
+      register: backup_dir_stat
+
+    - name: Criar diretório de backup se não existir
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0755'
+      when: not backup_dir_stat.stat.exists
+
+    - name: Verificar se o script setup.sh existe
+      ansible.builtin.stat:
+        path: "{{ setup_script_path }}"
+      register: setup_script_stat
+
+    - name: Falhar se o script setup.sh não existir
+      ansible.builtin.fail:
+        msg: "O script {{ setup_script_path }} não foi encontrado!"
+      when: not setup_script_stat.stat.exists
+
+    - name: Executar backup do Ansible
+      ansible.builtin.shell: |
+        {{ setup_script_path }} -b -e backup_dir={{ backup_dir }}
+      args:
+        executable: /bin/bash
+      register: backup_result
+      changed_when: backup_result.rc == 0
+
+    - name: Exibir resultado do backup
+      ansible.builtin.debug:
+        msg: "Backup executado com sucesso: {{ backup_result.stdout }}"
+      when: backup_result.rc == 0
+
+    - name: Listar todos os backups no diretório (ordenados por data)
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns: "*"
+        file_type: any
+      register: backup_files
+
+    - name: Ordenar backups por data de modificação (mais antigos primeiro)
+      ansible.builtin.set_fact:
+        sorted_backups: "{{ backup_files.files | sort(attribute='mtime') }}"
+
+    - name: Calcular quantidade de backups a remover
+      ansible.builtin.set_fact:
+        backups_to_remove: "{{ sorted_backups[:(sorted_backups|length - max_backups_to_keep)] }}"
+      when: sorted_backups | length > max_backups_to_keep
+
+    - name: Exibir backups que serão removidos
+      ansible.builtin.debug:
+        msg: "Removendo backup antigo: {{ item.path }}"
+      loop: "{{ backups_to_remove }}"
+      when: 
+        - sorted_backups | length > max_backups_to_keep
+        - backups_to_remove | length > 0
+
+    - name: Remover backups excedentes (manter apenas os últimos {{ max_backups_to_keep }})
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ backups_to_remove }}"
+      when: 
+        - sorted_backups | length > max_backups_to_keep
+        - backups_to_remove | length > 0
+
+    - name: Listar backups restantes após limpeza
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns: "*"
+        file_type: any
+      register: remaining_backups
+
+    - name: Exibir resumo final
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "RESUMO DO BACKUP"
+          - "============================================"
+          - "Diretório de backup: {{ backup_dir }}"
+          - "Backups mantidos: {{ max_backups_to_keep }}"
+          - "Backups atuais no diretório: {{ remaining_backups.matched }}"
+          - "Backups removidos: {{ backups_to_remove | default([]) | length }}"
+          - "Status: Backup concluído com sucesso"
+          - "============================================"
+
+    - name: Registrar log de execução
+      ansible.builtin.lineinfile:
+        path: "/var/log/ansible-backup.log"
+        line: "{{ ansible_date_time.iso8601 }} - Backup executado. Backups mantidos: {{ remaining_backups.matched }}"
+        create: yes
+        mode: '0644'
+      ignore_errors: yes
