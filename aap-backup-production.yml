@@ -1,0 +1,383 @@
+---
+- name: AAP Backup with Validation and Retention
+  hosts: localhost
+  gather_facts: yes
+  become: yes
+
+  vars:
+    bastion_host: "10.29.6.52"
+    database_host: "10.29.6.58"
+    database_data_dir: "/var/lib/pgsql/data"
+    backup_base_dir: "/bkp_aap"
+    
+    servers_to_validate:
+      - host: "10.29.6.53"
+        name: "Controller"
+      - host: "10.29.6.57"
+        name: "EDA"
+      - host: "10.29.6.55"
+        name: "Execution"
+      - host: "10.29.6.56"
+        name: "Private Hub"
+      - host: "10.29.6.58"
+        name: "Database"
+    
+    filesystems_to_check:
+      - "/var"
+      - "/home"
+      - "/usr"
+    
+    nfs_mount_targets:
+      - "/mnt/bkp/ctrl"
+      - "/mnt/bkp/git"
+      - "/mnt/bkp/eda"
+      - "/mnt/bkp/hub"
+      - "/mnt/bkp/data"
+      - "/mnt/bkp/lpa"
+      - "/mnt/bkp/mck"
+    
+    email_to: "admin@example.com"
+    email_from: "ansible-backup@example.com"
+    email_smtp_host: "localhost"
+    email_smtp_port: 25
+    
+    backup_status: "UNKNOWN"
+    backup_errors: []
+    backup_warnings: []
+    validation_results: {}
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: PRE-BACKUP VALIDATION
+    # =========================================================================
+
+    - name: Get PostgreSQL database directory size
+      ansible.builtin.shell: |
+        du -sb {{ database_data_dir }} | awk '{print $1}'
+      register: db_size_result
+      delegate_to: "{{ database_host }}"
+      changed_when: false
+      failed_when: db_size_result.rc != 0
+
+    - name: Set database size fact (in bytes)
+      ansible.builtin.set_fact:
+        database_size_bytes: "{{ db_size_result.stdout | int }}"
+        required_free_space_bytes: "{{ (db_size_result.stdout | int) * 2 }}"
+
+    - name: Calculate required free space in GB
+      ansible.builtin.set_fact:
+        database_size_gb: "{{ (database_size_bytes | int / 1024 / 1024 / 1024) | round(2) }}"
+        required_free_space_gb: "{{ (required_free_space_bytes | int / 1024 / 1024 / 1024) | round(2) }}"
+
+    - name: Display database size information
+      ansible.builtin.debug:
+        msg:
+          - "Database size: {{ database_size_gb }} GB"
+          - "Required free space per server: {{ required_free_space_gb }} GB (2x database size)"
+
+    - name: Validate disk space on all servers
+      block:
+        - name: Check free space on filesystems for each server
+          ansible.builtin.shell: |
+            df -B1 {{ item.1 }} | tail -1 | awk '{print $4}'
+          register: disk_space_check
+          delegate_to: "{{ item.0.host }}"
+          loop: "{{ servers_to_validate | product(filesystems_to_check) | list }}"
+          loop_control:
+            label: "{{ item.0.name }} ({{ item.0.host }}) - {{ item.1 }}"
+          changed_when: false
+          failed_when: false
+
+        - name: Evaluate disk space requirements
+          ansible.builtin.set_fact:
+            disk_validation_failures: "{{ disk_validation_failures | default([]) + [item.item[0].name + ' (' + item.item[0].host + ') - ' + item.item[1] + ': ' + ((item.stdout | int / 1024 / 1024 / 1024) | round(2) | string) + ' GB available, ' + required_free_space_gb + ' GB required'] }}"
+          loop: "{{ disk_space_check.results }}"
+          loop_control:
+            label: "{{ item.item[0].name }} - {{ item.item[1] }}"
+          when: (item.stdout | int) < (required_free_space_bytes | int)
+
+        - name: Fail if disk space validation failed
+          ansible.builtin.fail:
+            msg: |
+              ❌ DISK SPACE VALIDATION FAILED
+              
+              The following filesystems do not have enough free space:
+              {% for failure in disk_validation_failures %}
+              - {{ failure }}
+              {% endfor %}
+              
+              Each server must have at least {{ required_free_space_gb }} GB free (2x database size).
+          when: disk_validation_failures | default([]) | length > 0
+
+    - name: Get size of last backup in /bkp_aap
+      block:
+        - name: Find most recent backup
+          ansible.builtin.find:
+            paths: "{{ backup_base_dir }}"
+            patterns: "*.tar.gz"
+            file_type: file
+          register: existing_backups
+          delegate_to: "{{ bastion_host }}"
+
+        - name: Sort backups by modification time
+          ansible.builtin.set_fact:
+            sorted_backups: "{{ existing_backups.files | sort(attribute='mtime', reverse=true) }}"
+          when: existing_backups.matched > 0
+
+        - name: Get last backup size
+          ansible.builtin.set_fact:
+            last_backup_size_bytes: "{{ sorted_backups[0].size }}"
+            last_backup_size_gb: "{{ (sorted_backups[0].size / 1024 / 1024 / 1024) | round(2) }}"
+          when: existing_backups.matched > 0
+
+        - name: Set default if no previous backup exists
+          ansible.builtin.set_fact:
+            last_backup_size_bytes: "{{ database_size_bytes }}"
+            last_backup_size_gb: "{{ database_size_gb }}"
+          when: existing_backups.matched == 0
+
+    - name: Validate free space on /bkp_aap
+      block:
+        - name: Check free space on backup directory
+          ansible.builtin.shell: |
+            df -B1 {{ backup_base_dir }} | tail -1 | awk '{print $4}'
+          register: backup_dir_free_space
+          delegate_to: "{{ bastion_host }}"
+          changed_when: false
+
+        - name: Set backup directory free space
+          ansible.builtin.set_fact:
+            backup_free_space_bytes: "{{ backup_dir_free_space.stdout | int }}"
+            backup_free_space_gb: "{{ (backup_dir_free_space.stdout | int / 1024 / 1024 / 1024) | round(2) }}"
+
+        - name: Fail if insufficient space for backup
+          ansible.builtin.fail:
+            msg: |
+              ❌ INSUFFICIENT SPACE ON BACKUP DIRECTORY
+              
+              Backup directory: {{ backup_base_dir }}
+              Free space available: {{ backup_free_space_gb }} GB
+              Last backup size: {{ last_backup_size_gb }} GB
+              
+              Free space must be >= last backup size.
+          when: (backup_free_space_bytes | int) < (last_backup_size_bytes | int)
+
+    - name: Validation successful
+      ansible.builtin.debug:
+        msg:
+          - "✅ All disk space validations passed"
+          - "Database size: {{ database_size_gb }} GB"
+          - "Backup directory free space: {{ backup_free_space_gb }} GB"
+
+    # =========================================================================
+    # PHASE 2: DELETE OLD BACKUPS
+    # =========================================================================
+
+    - name: Delete all existing backups (retention = 1)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ existing_backups.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      delegate_to: "{{ bastion_host }}"
+      when: existing_backups.matched > 0
+
+    # =========================================================================
+    # PHASE 3: EXECUTE BACKUP
+    # =========================================================================
+
+    - name: Execute AAP backup
+      block:
+        - name: Run setup.sh backup command
+          ansible.builtin.shell: |
+            cd /opt/ansible-automation-platform/installer
+            ./setup.sh -b -e backup_dir={{ backup_base_dir }}
+          register: backup_execution
+          delegate_to: "{{ bastion_host }}"
+          failed_when: backup_execution.rc != 0
+
+        - name: Set backup status to SUCCESS
+          ansible.builtin.set_fact:
+            backup_status: "SUCCESS"
+
+      rescue:
+        - name: Set backup status to FAILURE
+          ansible.builtin.set_fact:
+            backup_status: "FAILURE"
+            backup_errors: "{{ backup_errors + ['Backup execution failed: ' + backup_execution.stderr | default('Unknown error')] }}"
+
+        - name: Fail playbook due to backup failure
+          ansible.builtin.fail:
+            msg: "❌ Backup execution failed. Check logs for details."
+
+    # =========================================================================
+    # PHASE 4: POST-BACKUP ACTIONS
+    # =========================================================================
+
+    - name: Get newly created backup information
+      ansible.builtin.find:
+        paths: "{{ backup_base_dir }}"
+        patterns: "*.tar.gz"
+        file_type: file
+      register: new_backup_files
+      delegate_to: "{{ bastion_host }}"
+
+    - name: Fail if no backup was created
+      ansible.builtin.fail:
+        msg: "❌ No backup file was created in {{ backup_base_dir }}"
+      when: new_backup_files.matched == 0
+
+    - name: Set new backup file path and size
+      ansible.builtin.set_fact:
+        new_backup_path: "{{ (new_backup_files.files | sort(attribute='mtime', reverse=true))[0].path }}"
+        new_backup_size_bytes: "{{ (new_backup_files.files | sort(attribute='mtime', reverse=true))[0].size }}"
+        new_backup_size_gb: "{{ ((new_backup_files.files | sort(attribute='mtime', reverse=true))[0].size / 1024 / 1024 / 1024) | round(2) }}"
+        backup_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Display backup information
+      ansible.builtin.debug:
+        msg:
+          - "Backup file: {{ new_backup_path }}"
+          - "Backup size: {{ new_backup_size_gb }} GB"
+          - "Backup timestamp: {{ backup_timestamp }}"
+
+    - name: Copy backup to all NFS mount points
+      ansible.builtin.copy:
+        src: "{{ new_backup_path }}"
+        dest: "{{ item }}/{{ new_backup_path | basename }}"
+        remote_src: yes
+      loop: "{{ nfs_mount_targets }}"
+      delegate_to: "{{ bastion_host }}"
+      register: copy_results
+      failed_when: false
+
+    - name: Check for copy failures
+      ansible.builtin.set_fact:
+        backup_warnings: "{{ backup_warnings + ['Failed to copy backup to ' + item.item] }}"
+      loop: "{{ copy_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.failed | default(false)
+
+    # =========================================================================
+    # PHASE 5: POST-BACKUP DISK SPACE CHECK
+    # =========================================================================
+
+    - name: Check post-backup free space on all filesystems
+      ansible.builtin.shell: |
+        df -h {{ item.1 }} | tail -1 | awk '{print $4}'
+      register: post_backup_space
+      delegate_to: "{{ item.0.host }}"
+      loop: "{{ servers_to_validate | product(filesystems_to_check) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1 }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Check post-backup free space on /bkp_aap
+      ansible.builtin.shell: |
+        df -h {{ backup_base_dir }} | tail -1 | awk '{print $4}'
+      register: post_backup_bkp_space
+      delegate_to: "{{ bastion_host }}"
+      changed_when: false
+
+    - name: Build post-backup space report
+      ansible.builtin.set_fact:
+        post_backup_report: |
+          {% for result in post_backup_space.results %}
+          {{ result.item[0].name }} ({{ result.item[0].host }}) - {{ result.item[1] }}: {{ result.stdout }}
+          {% endfor %}
+          Backup Directory ({{ bastion_host }}) - {{ backup_base_dir }}: {{ post_backup_bkp_space.stdout }}
+
+    # =========================================================================
+    # PHASE 6: EMAIL REPORT
+    # =========================================================================
+
+    - name: Send email report
+      ansible.builtin.mail:
+        host: "{{ email_smtp_host }}"
+        port: "{{ email_smtp_port }}"
+        from: "{{ email_from }}"
+        to: "{{ email_to }}"
+        subject: "AAP Backup Report - {{ backup_status }} - {{ ansible_date_time.date }}"
+        body: |
+          =====================================================
+          ANSIBLE AUTOMATION PLATFORM BACKUP REPORT
+          =====================================================
+          
+          Status: {{ backup_status }}
+          Timestamp: {{ backup_timestamp }}
+          
+          =====================================================
+          BACKUP INFORMATION
+          =====================================================
+          
+          Backup File: {{ new_backup_path | basename }}
+          Backup Size: {{ new_backup_size_gb }} GB
+          Backup Location: {{ backup_base_dir }}
+          
+          =====================================================
+          DATABASE INFORMATION
+          =====================================================
+          
+          Database Host: {{ database_host }}
+          Database Directory: {{ database_data_dir }}
+          Database Size: {{ database_size_gb }} GB
+          
+          =====================================================
+          POST-BACKUP FREE SPACE
+          =====================================================
+          
+          {{ post_backup_report }}
+          
+          =====================================================
+          VALIDATED SERVERS
+          =====================================================
+          
+          {% for server in servers_to_validate %}
+          - {{ server.name }} ({{ server.host }})
+          {% endfor %}
+          
+          =====================================================
+          WARNINGS
+          =====================================================
+          
+          {% if backup_warnings | length > 0 %}
+          {% for warning in backup_warnings %}
+          ⚠️  {{ warning }}
+          {% endfor %}
+          {% else %}
+          None
+          {% endif %}
+          
+          =====================================================
+          ERRORS
+          =====================================================
+          
+          {% if backup_errors | length > 0 %}
+          {% for error in backup_errors %}
+          ❌ {{ error }}
+          {% endfor %}
+          {% else %}
+          None
+          {% endif %}
+          
+          =====================================================
+          END OF REPORT
+          =====================================================
+      delegate_to: "{{ bastion_host }}"
+      when: backup_status in ['SUCCESS', 'FAILURE']
+      failed_when: false
+
+    - name: Final status message
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "BACKUP COMPLETED: {{ backup_status }}"
+          - "=========================================="
+          - "Backup file: {{ new_backup_path | basename }}"
+          - "Size: {{ new_backup_size_gb }} GB"
+          - "Timestamp: {{ backup_timestamp }}"
+          - "Email report sent to: {{ email_to }}"
+          - "=========================================="
